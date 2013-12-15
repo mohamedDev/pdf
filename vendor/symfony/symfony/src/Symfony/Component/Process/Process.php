@@ -59,6 +59,7 @@ class Process
     private $incrementalErrorOutputOffset;
 
     private $useFileHandles = false;
+    /** @var ProcessPipes */
     private $processPipes;
 
     private static $sigchild;
@@ -116,12 +117,12 @@ class Process
     /**
      * Constructor.
      *
-     * @param string  $commandline The command line to run
-     * @param string  $cwd         The working directory
-     * @param array   $env         The environment variables or null to inherit
-     * @param string  $stdin       The STDIN content
-     * @param integer $timeout     The timeout in seconds
-     * @param array   $options     An array of options for proc_open
+     * @param string             $commandline The command line to run
+     * @param string|null        $cwd         The working directory or null to use the working dir of the current PHP process
+     * @param array|null         $env         The environment variables or null to inherit
+     * @param string|null        $stdin       The STDIN content
+     * @param integer|float|null $timeout     The timeout in seconds or null to disable
+     * @param array              $options     An array of options for proc_open
      *
      * @throws RuntimeException When proc_open is not installed
      *
@@ -304,30 +305,20 @@ class Process
         if (null !== $callback) {
             $this->callback = $this->buildCallback($callback);
         }
-        while ($this->processInformation['running']) {
+
+        do {
             $this->checkTimeout();
-            $this->updateStatus(true);
-        }
-        $this->updateStatus(false);
+            $running = defined('PHP_WINDOWS_VERSION_BUILD') ? $this->isRunning() : $this->processPipes->hasOpenHandles();
+            $close = !defined('PHP_WINDOWS_VERSION_BUILD') || !$running;;
+            $this->readPipes(true, $close);
+        } while ($running);
 
-        // Unix pipes must be closed before calling proc_close to void deadlock
-        // see manual http://php.net/manual/en/function.proc-close.php
-        $this->processPipes->closeUnixPipes();
-        $exitcode = proc_close($this->process);
-
-        // Windows only : when using file handles, some activity may occur after
-        // calling proc_close
-        while($this->processPipes->hasOpenHandles()) {
-            usleep(100);
-            foreach ($this->processPipes->readAndCloseHandles(true) as $type => $data) {
-                if (3 == $type) {
-                    $this->fallbackExitcode = (int) $data;
-                } else {
-                    call_user_func($this->callback, $type === self::STDOUT ? self::OUT : self::ERR, $data);
-                }
-            }
+        while ($this->isRunning()) {
+            usleep(1000);
         }
+
         $this->processPipes->close();
+        $exitcode = proc_close($this->process);
 
         if ($this->processInformation['signaled']) {
             if ($this->isSigchildEnabled()) {
@@ -355,7 +346,7 @@ class Process
      */
     public function getOutput()
     {
-        $this->readPipes(false);
+        $this->readPipes(false, defined('PHP_WINDOWS_VERSION_BUILD') ? !$this->processInformation['running'] : true);
 
         return $this->stdout;
     }
@@ -387,7 +378,7 @@ class Process
      */
     public function getErrorOutput()
     {
-        $this->readPipes(false);
+        $this->readPipes(false, defined('PHP_WINDOWS_VERSION_BUILD') ? !$this->processInformation['running'] : true);
 
         return $this->stderr;
     }
@@ -667,7 +658,7 @@ class Process
     /**
      * Gets the process timeout.
      *
-     * @return integer|null The timeout in seconds or null if it's disabled
+     * @return float|null The timeout in seconds or null if it's disabled
      */
     public function getTimeout()
     {
@@ -679,7 +670,7 @@ class Process
      *
      * To disable the timeout, set this value to null.
      *
-     * @param float|null $timeout The timeout in seconds
+     * @param integer|float|null $timeout The timeout in seconds
      *
      * @return self The current Process instance
      *
@@ -687,15 +678,11 @@ class Process
      */
     public function setTimeout($timeout)
     {
-        if (null === $timeout) {
-            $this->timeout = null;
-
-            return $this;
-        }
-
         $timeout = (float) $timeout;
 
-        if ($timeout < 0) {
+        if (0.0 === $timeout) {
+            $timeout = null;
+        } elseif ($timeout < 0) {
             throw new InvalidArgumentException('The timeout value must be a valid positive integer or float number.');
         }
 
@@ -707,11 +694,10 @@ class Process
     /**
      * Gets the working directory.
      *
-     * @return string The current working directory
+     * @return string|null The current working directory or null on failure
      */
     public function getWorkingDirectory()
     {
-        // This is for BC only
         if (null === $this->cwd) {
             // getcwd() will return false if any one of the parent directories does not have
             // the readable or search mode set, even if the current directory does
@@ -774,7 +760,7 @@ class Process
     /**
      * Gets the contents of STDIN.
      *
-     * @return string The current contents
+     * @return string|null The current contents
      */
     public function getStdin()
     {
@@ -784,7 +770,7 @@ class Process
     /**
      * Sets the contents of STDIN.
      *
-     * @param string $stdin The new contents
+     * @param string|null $stdin The new contents
      *
      * @return self The current Process instance
      */
@@ -884,7 +870,7 @@ class Process
      */
     public function checkTimeout()
     {
-        if (0 < $this->timeout && $this->timeout < microtime(true) - $this->starttime) {
+        if (null !== $this->timeout && $this->timeout < microtime(true) - $this->starttime) {
             $this->stop(0);
 
             throw new RuntimeException('The process timed-out.');
@@ -932,9 +918,9 @@ class Process
             return;
         }
 
-        $this->readPipes($blocking);
-
         $this->processInformation = proc_get_status($this->process);
+        $this->readPipes($blocking, defined('PHP_WINDOWS_VERSION_BUILD') ? !$this->processInformation['running'] : true);
+
         if (!$this->processInformation['running']) {
             $this->status = self::STATUS_TERMINATED;
             if (-1 !== $this->processInformation['exitcode']) {
@@ -965,9 +951,15 @@ class Process
      *
      * @param Boolean $blocking Whether to use blocking calls or not.
      */
-    private function readPipes($blocking)
+    private function readPipes($blocking, $close)
     {
-        foreach ($this->processPipes->read($blocking) as $type => $data) {
+        if ($close) {
+            $result = $this->processPipes->readAndCloseHandles($blocking);
+        } else {
+            $result = $this->processPipes->read($blocking);
+        }
+
+        foreach ($result as $type => $data) {
             if (3 == $type) {
                 $this->fallbackExitcode = (int) $data;
             } else {

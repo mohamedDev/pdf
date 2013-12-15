@@ -97,7 +97,7 @@ class Crawler extends \SplObjectStorage
         }
 
         $charset = null;
-        if (false !== $pos = strpos($type, 'charset=')) {
+        if (false !== $pos = stripos($type, 'charset=')) {
             $charset = substr($type, $pos + 8);
             if (false !== $pos = strpos($charset, ';')) {
                 $charset = substr($charset, 0, $pos);
@@ -504,6 +504,7 @@ class Crawler extends \SplObjectStorage
     public function extract($attributes)
     {
         $attributes = (array) $attributes;
+        $count = count($attributes);
 
         $data = array();
         foreach ($this as $node) {
@@ -516,7 +517,7 @@ class Crawler extends \SplObjectStorage
                 }
             }
 
-            $data[] = count($attributes) > 1 ? $elements : $elements[0];
+            $data[] = $count > 1 ? $elements : $elements[0];
         }
 
         return $data;
